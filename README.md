@@ -4,13 +4,13 @@
 
 For Sentinel-2 data in the Copernicus Data Space Ecosystem Catalogue, notifications about updated products can be received as "modified" events. When these notifications are received, the corresponding Sentinel Product must be updated on the STAC Catalog and its files overwritten.
 
-This system handles the workflow for reprocessing Sentinel-2 products when "modified" notifications are received. It maintains data consistency through distributed locking (Redis) and provides reliable event tracking via PostgreSQL.
+This system handles the workflow for reprocessing Sentinel-2 products when "modified" notifications are received. It maintains data consistency through distributed locking (Redis) and uses Redis as the storage backend for both notifications and processing status.
 
 **Key Characteristics:**
 - Processes ~35 modified notifications per hour globally
 - Runs batch job every 10 minutes with automatic conflict prevention
 - Prevents duplicate processing through Redis-based distributed locks
-- Audit trail preserved via PostgreSQL historical records
+- Fully Redis-based architecture — no SQL database required
 
 ## System Architecture
 
@@ -18,78 +18,74 @@ This system handles the workflow for reprocessing Sentinel-2 products when "modi
 
 The modified notifications reprocessing system consists of three main components:
 
-1. **PostgreSQL Table** - Stores notifications awaiting reprocessing
-2. **Redis Cache** - Tracks the processing status of each product to prevent conflicts
-3. **Batch application** - Sends the modified events to the queue for processing
+1. **Redis Notifications Cache** (separate Redis instance) - Stores notifications awaiting reprocessing
+2. **Redis Processing Status Cache** (separate Redis instance) - Tracks the processing status of each product to prevent conflicts
+3. **Batch Application** - Sends the modified events to the queue for processing
+
+Each cache is a separate Redis instance for isolation and scalability.
 
 ### System Workflow
 
 ```
 1. Notification Received
    ↓
-2. Stored in PostgreSQL (events.modified_notifications table)
+2. Stored in Redis Notifications Cache (db 0 of redis_notifications)
+   Key = product_id, Value = JSON {inserted_at, notification}
    ↓
 3. Batch Job Runs Every 10 Minutes
-   ├─ Query: unprocessed events older than 10 minutes
-   ├─ Check: Is product locked in Redis? (processing lock = product_id key)
-   ├─ If unlocked: Send to Service Bus Queue
-   └─ Mark as processed in PostgreSQL
+   ├─ Scan: all keys in notifications cache (db 0)
+   ├─ Filter: only entries older than 10 minutes
+   ├─ Check: Is product in processing status cache (db 1)?
+   ├─ If not processing: Send to Service Bus Queue
+   └─ Remove entry from notifications cache (db 0)
    ↓
 4. Processors Handle Event
    ├─ Update STAC Catalog
    ├─ Overwrite product files
-   └─ Delete Redis lock (marks complete)
+   └─ Delete processing status key from db 1 (marks complete)
 ```
 
 ---
 
-## PostgreSQL Notifications Table
+## Redis Notifications Cache (db 0 of redis_notifications)
 
-PostgreSQL is used for the following reasons:
-- Efficient querying and batch operations
-- Scalability is not a concern (average of 35 modifications per hour globally; PostgreSQL supports 100+ connections by default)
-- Historical record tracking for audit and debugging purposes
+The notifications cache stores modified notifications awaiting reprocessing:
+- When a "modified" notification is received, it is written to Redis db 0
+- The batch application reads from this cache and removes entries after sending them to the queue
+- If the same product_id is received again, the entry is overwritten with the latest notification
 
-**Postgres instance**: TBD with Infra team
+### Entry Format
 
-**Database Name**: TBD depending on Postgres instance
+Each notification is stored as:
+- **Key**: `{product_id}` (e.g., `0d2e6901-b963-4718-a96e-17e8b0834b6b`)
+- **Value**: JSON string containing:
+  - `inserted_at` — ISO 8601 timestamp when the notification was inserted
+  - `notification` — Complete notification payload to be resent to the queue
 
-**Schema Name**: events
-
-**Table Name**: modified_notifications
-
-### Table Schema
-
-| Column Name | Data Type | Description |
-|---|---|---|
-| notification_timestamp | TIMESTAMPTZ | Timestamp when the notification was received |
-| product_id | TEXT | Sentinel-2 product identifier to be reprocessed |
-| notification | JSONB | Complete JSON notification payload to be resent to the queue |
-| processed | BOOLEAN | Processing status: True if sent to queue, False if pending |
-
-This table maintains both historical records and notifications pending reprocessing.
-
-### DDL Create Table Statement
-
-```sql
-CREATE TABLE events.modified_notifications (
-    notification_timestamp TIMESTAMPTZ NOT NULL,
-    product_id             TEXT        NOT NULL UNIQUE,
-    notification           JSONB       NOT NULL,
-    processed              BOOLEAN     NOT NULL DEFAULT FALSE
-);
+Example value:
+```json
+{
+  "inserted_at": "2026-03-27T10:15:00+00:00",
+  "notification": {
+    "product_id": "0d2e6901-b963-4718-a96e-17e8b0834b6b",
+    "timestamp": "2026-03-27T10:15:00+00:00",
+    "status": "modified",
+    "collection": "SENTINEL-2",
+    "processingLevel": "L2A"
+  }
+}
 ```
 
 ---
 
-## Redis Cache for Processing Status
+## Redis Processing Status Cache (db 0 of redis_processing)
 
-The Redis cache maintains a record of products currently being processed:
-- When processing of a product begins, an entry is written to Redis with the **Product ID as the key** and **"processing" as the value**
+The processing status cache maintains a record of products currently being processed:
+- When processing of a product begins, an entry is written to Redis db 1 with the **Product ID as the key** and **"processing" as the value**
 - Once sentinel product is uploaded to STAC Catalog, the corresponding entry is deleted from Redis
 - Entries serve as locks to prevent concurrent processing of the same product
 
-### Redis Entry Format
+### Entry Format
 
 Each product being processed is stored in Redis as:
 - **Key**: `{product_id}` (e.g., `0d2e6901-b963-4718-a96e-17e8b0834b6b`)
@@ -102,35 +98,29 @@ Each product being processed is stored in Redis as:
 
 Every 10 minutes, the batch processing application executes the following steps:
 
-### Step 1: Query PostgreSQL for Pending Notifications
+### Step 1: Read All Notifications from Redis Cache (db 0)
 
-Retrieve all unprocessed notifications that are older than 10 minutes (this delay ensures stability and prevents conflicts):
+Scan all keys in the notifications cache and parse each entry's `inserted_at` timestamp.
 
-```sql
-SELECT
-    notification_timestamp,
-    product_id,
-    notification
-FROM notifications
-WHERE processed = FALSE
-  AND notification_timestamp <= NOW() - INTERVAL '10 minutes'
-ORDER BY notification_timestamp;
-```
+### Step 2: Filter Notifications Older Than 10 Minutes
 
-### Step 2: Check Redis Cache for Product Processing Status
+Only notifications with an `inserted_at` timestamp older than 10 minutes are considered eligible. This delay ensures stability and prevents conflicts with in-flight operations.
 
-For each notification retrieved from PostgreSQL, check if the product is already being processed:
-- Query Redis cache using the `product_id`
-- If an entry exists in Redis, the product is currently being processed → skip this notification
-- If no entry exists in Redis, the product is not being processed → proceed to Step 3
+### Step 3: Check Redis Processing Status Cache (db 1)
 
-### Step 3: Send Notifications to Service Bus Queue for processing
+For each eligible notification, check if the product is already being processed:
+- Query Redis db 0 of redis_processing using the `product_id`
+- If an entry exists, the product is currently being processed → skip this notification
+- If no entry exists, the product is not being processed → proceed to Step 4
 
-For products that are not currently being processed (not found in Redis cache):
+### Step 4: Send Notifications to Service Bus Queue and Remove from Cache
+
+For products that are not currently being processed:
 - Send the modified notification to the Service Bus Queue
+- Remove the entry from the notifications cache (db 0)
 - The queue will pass the notification to processors for reprocessing
 - Processors will update the STAC catalog and overwrite previous product files
-- Once processing completes, the Redis entry for that product is deleted
+- Once processing completes, the Redis entry in db 1 for that product is deleted
 
 This workflow ensures no product is reprocessed multiple times simultaneously, maintaining data consistency.
 
@@ -146,25 +136,19 @@ This workflow ensures no product is reprocessed multiple times simultaneously, m
 
 ```
 sandbox/
-├── app/                          # Application code
-│   ├── batch_processing.py       # Main batch job
-│   ├── sample_insert_notification.py
-│   ├── seed_redis.py
-│   └── seed_redis_extended.py
+├── app/                              # Application code
+│   ├── batch_processing.py           # Main batch job (reads from db 0, checks db 1)
+│   ├── sample_insert_notification.py # Reference script for inserting notifications
+│   ├── seed_redis.py                 # Seeds test data into both Redis caches
+│   └── seed_redis_extended.py        # Extended test data seeding
 │
-├── docs/                         # Additional documentation
+├── docs/                             # Additional documentation
 │   ├── SIMULATION_INSTRUCTIONS.md
-│   ├── EXTENDED_TESTING.md
-│   └── Data Architecture Lucid Chart.png
-│
-├── sql/                          # Database initialization files
-│   ├── init_test_data.sql
-│   └── additional_test_data.sql
+│   └── EXTENDED_TESTING.md
 │
 ├── docker-compose.yml
 ├── Dockerfile
-├── requirements_batch.txt
-├── README.md                     # This file
+├── README.md                         # This file
 └── .gitignore
 ```
 
@@ -182,7 +166,7 @@ sandbox/
 docker compose up -d
 ```
 
-This starts three services: postgres, redis, and seed-redis.
+This starts two services: redis and seed-redis (which populates test data).
 
 ### 2. Verify Services Are Healthy
 
@@ -201,18 +185,19 @@ docker compose run --rm batch
 ### 4. Verify Results
 
 ```powershell
-# Check PostgreSQL for processed events
-docker compose exec postgres psql -U sentinel -d sentinel_events -c "SELECT product_id, processed FROM events.modified_notifications;"
+# Check notifications cache (db 0 of redis_notifications) — processed entries should be removed
+docker compose exec redis_notifications redis-cli -n 0 KEYS '*'
 
-# Check Redis locks
-docker compose exec redis redis-cli KEYS '*'
+# Check processing status cache (db 0 of redis_processing)
+docker compose exec redis_processing redis-cli -n 0 KEYS '*'
+
+# Inspect a specific notification entry
+docker compose exec redis_notifications redis-cli -n 0 GET "<product_id>"
 ```
 
 ---
 
-
-
 ## Additional Documentation
 
 - **[Simulation Instructions](docs/SIMULATION_INSTRUCTIONS.md)** — Step-by-step demo walkthrough
-- **[Extended Testing Scenarios](docs/EXTENDED_TESTING.md)** — Advanced test cases with 20 products
+- **[Extended Testing Scenarios](docs/EXTENDED_TESTING.md)** — Advanced test cases with additional products
