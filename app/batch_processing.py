@@ -2,50 +2,40 @@
 Sentinel-2 Modified Notifications - Batch Processing Application (Demo)
 
 This script simulates the batch processing application workflow:
-  1. Query PostgreSQL for unprocessed notifications older than 10 minutes
-  2. Check Redis to see if each product is currently being processed
-  3. Send eligible notifications to the queue (simulated with print output)
-  4. Mark sent notifications as processed in PostgreSQL
+  1. Read all notifications from the Redis notifications cache (db 0)
+  2. Filter notifications older than 10 minutes
+  3. Check Redis processing status cache (db 1) to see if each product is currently being processed
+  4. Send eligible notifications to the queue (simulated with print output)
+  5. Remove sent notifications from the Redis notifications cache
 """
 
 import json
 import os
+from datetime import datetime, timezone, timedelta
 
-import psycopg2
 import redis
 
 # ---------------------------------------------------------------------------
 # Configuration (reads from environment variables, with localhost defaults)
 # ---------------------------------------------------------------------------
-POSTGRES_CONFIG = {
-    "host": os.environ.get("POSTGRES_HOST", "localhost"),
-    "port": int(os.environ.get("POSTGRES_PORT", 5432)),
-    "dbname": os.environ.get("POSTGRES_DB", "sentinel_events"),
-    "user": os.environ.get("POSTGRES_USER", "sentinel"),
-    "password": os.environ.get("POSTGRES_PASSWORD", "sentinel_pass"),
+REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
+
+# db 0 = modified notifications cache
+REDIS_NOTIFICATIONS_CONFIG = {
+    "host": REDIS_HOST,
+    "port": REDIS_PORT,
+    "db": 0,
 }
 
-REDIS_CONFIG = {
-    "host": os.environ.get("REDIS_HOST", "localhost"),
-    "port": int(os.environ.get("REDIS_PORT", 6379)),
+# db 1 = processing status cache
+REDIS_PROCESSING_CONFIG = {
+    "host": REDIS_HOST,
+    "port": REDIS_PORT,
+    "db": 1,
 }
 
-BATCH_QUERY = """
-    SELECT
-        notification_timestamp,
-        product_id,
-        notification
-    FROM events.modified_notifications
-    WHERE processed = FALSE
-      AND notification_timestamp <= NOW() - INTERVAL '10 minutes'
-    ORDER BY notification_timestamp;
-"""
-
-MARK_PROCESSED_QUERY = """
-    UPDATE events.modified_notifications
-    SET processed = TRUE
-    WHERE product_id = %s;
-"""
+DELAY_MINUTES = 10
 
 
 # ---------------------------------------------------------------------------
@@ -73,103 +63,115 @@ def run_batch():
     print_separator()
 
     # -----------------------------------------------------------------------
-    # Connect to PostgreSQL
+    # Connect to Redis notifications cache (db 0)
     # -----------------------------------------------------------------------
-    print("\n[Postgres] Connecting to PostgreSQL...")
-    pg_conn = psycopg2.connect(**POSTGRES_CONFIG)
-    pg_cursor = pg_conn.cursor()
-    print("[Postgres] Connected successfully.")
+    print("\n[Redis] Connecting to notifications cache (db 0)...")
+    notifications_client = redis.Redis(**REDIS_NOTIFICATIONS_CONFIG, decode_responses=True)
+    notifications_client.ping()
+    print("[Redis] Notifications cache connected successfully.")
 
     # -----------------------------------------------------------------------
-    # Connect to Redis
+    # Connect to Redis processing status cache (db 1)
     # -----------------------------------------------------------------------
-    print("\n[Redis] Connecting to Redis...")
-    redis_client = redis.Redis(**REDIS_CONFIG, decode_responses=True)
-    redis_client.ping()
-    print("[Redis] Connected successfully.")
+    print("\n[Redis] Connecting to processing status cache (db 1)...")
+    processing_client = redis.Redis(**REDIS_PROCESSING_CONFIG, decode_responses=True)
+    processing_client.ping()
+    print("[Redis] Processing status cache connected successfully.")
 
     # -----------------------------------------------------------------------
-    # STEP 1: Query PostgreSQL for pending notifications
+    # STEP 1: Read all notifications from the notifications cache
     # -----------------------------------------------------------------------
-    print_step(1, "Query PostgreSQL for Pending Notifications")
+    print_step(1, "Read Notifications from Redis Cache (db 0)")
 
-    print("[Postgres] Executing batch query:")
-    print("    SELECT product_id, notification_timestamp")
-    print("    FROM events.modified_notifications")
-    print("    WHERE processed = FALSE")
-    print("      AND notification_timestamp <= NOW() - INTERVAL '10 minutes'")
+    print("[Redis] Scanning all keys in notifications cache...")
     print()
 
-    pg_cursor.execute(BATCH_QUERY)
-    pending_notifications = pg_cursor.fetchall()
+    cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=DELAY_MINUTES)
+    all_notifications = []
 
-    if not pending_notifications:
-        print("[Postgres] No pending notifications found. Nothing to process.")
-        pg_cursor.close()
-        pg_conn.close()
+    for key in notifications_client.scan_iter("*"):
+        raw_value = notifications_client.get(key)
+        if raw_value is None:
+            continue
+        entry = json.loads(raw_value)
+        inserted_at = datetime.fromisoformat(entry["inserted_at"])
+        all_notifications.append((key, inserted_at, entry))
+
+    if not all_notifications:
+        print("[Redis] No notifications found in cache. Nothing to process.")
         return
 
-    print(f"[Postgres] Found {len(pending_notifications)} pending notification(s):\n")
-    for row in pending_notifications:
-        ts, product_id, _ = row
-        print(f"    - {product_id}")
-        print(f"      Notification timestamp: {ts}")
-    print()
+    print(f"[Redis] Found {len(all_notifications)} notification(s) in cache.\n")
 
     # -----------------------------------------------------------------------
-    # STEP 2: Check Redis for products currently being processed
+    # STEP 2: Filter notifications older than 10 minutes
     # -----------------------------------------------------------------------
-    print_step(2, "Check Redis Cache for Product Processing Status")
+    print_step(2, f"Filter Notifications Older Than {DELAY_MINUTES} Minutes")
+
+    print(f"    Cutoff time: {cutoff_time.isoformat()}\n")
+
+    pending_notifications = []
+
+    for product_id, inserted_at, entry in all_notifications:
+        if inserted_at <= cutoff_time:
+            print(f"    [PENDING] {product_id}")
+            print(f"              Inserted at: {inserted_at.isoformat()}")
+            pending_notifications.append((product_id, inserted_at, entry))
+        else:
+            print(f"    [TOO NEW] {product_id}")
+            print(f"              Inserted at: {inserted_at.isoformat()} → not yet eligible")
+
+    print(f"\n    {len(pending_notifications)} notification(s) eligible for processing.\n")
+
+    if not pending_notifications:
+        print("[Batch] No notifications old enough. Nothing to process.")
+        return
+
+    # -----------------------------------------------------------------------
+    # STEP 3: Check Redis processing status cache for conflicts
+    # -----------------------------------------------------------------------
+    print_step(3, "Check Redis Processing Status Cache (db 1)")
 
     eligible = []
     skipped = []
 
-    for row in pending_notifications:
-        ts, product_id, notification = row
-        redis_key = product_id
-        is_processing = redis_client.exists(redis_key)
+    for product_id, inserted_at, entry in pending_notifications:
+        is_processing = processing_client.exists(product_id)
 
         if is_processing:
-            status = redis_client.get(redis_key)
+            status = processing_client.get(product_id)
             print(f"    [SKIP] {product_id}")
-            print(f"           Redis key '{redis_key}' EXISTS with status '{status}' → product is being processed.")
-            skipped.append(row)
+            print(f"           Processing status key EXISTS with status '{status}' → product is being processed.")
+            skipped.append((product_id, inserted_at, entry))
         else:
             print(f"    [OK]   {product_id}")
-            print(f"           Redis key '{redis_key}' NOT FOUND → product is available.")
-            eligible.append(row)
+            print(f"           Processing status key NOT FOUND → product is available.")
+            eligible.append((product_id, inserted_at, entry))
 
     print(f"\n    Summary: {len(eligible)} eligible, {len(skipped)} skipped.\n")
 
     if not eligible:
         print("[Batch] All pending products are currently being processed. Nothing to send.")
-        pg_cursor.close()
-        pg_conn.close()
         return
 
     # -----------------------------------------------------------------------
-    # STEP 3: Send eligible notifications to Service Bus Queue
+    # STEP 4: Send eligible notifications to Service Bus Queue
     # -----------------------------------------------------------------------
-    print_step(3, "Send Notifications to Service Bus Queue")
+    print_step(4, "Send Notifications to Service Bus Queue")
 
     sent_count = 0
-    for row in eligible:
-        ts, product_id, notification = row
-
-        # In production, this would send to Azure Service Bus.
-        # For this demo, we simulate the send with print output.
-        notification_data = json.dumps(notification, indent=6, default=str)
+    for product_id, inserted_at, entry in eligible:
+        notification_data = json.dumps(entry["notification"], indent=6, default=str)
 
         print(f"    [SEND] Sending to Service Bus Queue:")
-        print(f"           Product ID : {product_id}")
-        print(f"           Timestamp  : {ts}")
-        print(f"           Payload    : {notification_data[:200]}...")
+        print(f"           Product ID  : {product_id}")
+        print(f"           Inserted at : {inserted_at.isoformat()}")
+        print(f"           Payload     : {notification_data[:200]}...")
         print()
 
-        # Mark as processed in PostgreSQL
-        pg_cursor.execute(MARK_PROCESSED_QUERY, (product_id,))
-        pg_conn.commit()
-        print(f"    [DB]   Marked as processed in PostgreSQL.\n")
+        # Remove from notifications cache (replaces the old PostgreSQL UPDATE processed=TRUE)
+        notifications_client.delete(product_id)
+        print(f"    [CACHE] Removed from notifications cache (db 0).\n")
 
         sent_count += 1
 
@@ -178,24 +180,19 @@ def run_batch():
     # -----------------------------------------------------------------------
     print_step("✓", "Batch Processing Complete")
 
-    print(f"    Notifications found in PostgreSQL : {len(pending_notifications)}")
-    print(f"    Skipped (being processed in Redis): {len(skipped)}")
-    print(f"    Sent to Service Bus Queue         : {sent_count}")
+    print(f"    Notifications found in cache       : {len(all_notifications)}")
+    print(f"    Too new (< {DELAY_MINUTES} min)               : {len(all_notifications) - len(pending_notifications)}")
+    print(f"    Skipped (being processed in db 1)  : {len(skipped)}")
+    print(f"    Sent to Service Bus Queue           : {sent_count}")
     print()
 
     if skipped:
         print("    Skipped products (currently processing):")
-        for row in skipped:
-            print(f"      - {row[1]}")
+        for product_id, _, _ in skipped:
+            print(f"      - {product_id}")
         print()
 
-    # -----------------------------------------------------------------------
-    # Cleanup connections
-    # -----------------------------------------------------------------------
-    pg_cursor.close()
-    pg_conn.close()
-    print("[Postgres] Connection closed.")
-    print("[Redis] Connection closed.")
+    print("[Redis] Done.")
     print()
     print_separator()
     print("  BATCH PROCESSING FINISHED")
