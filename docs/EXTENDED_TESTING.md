@@ -17,28 +17,31 @@ This guide walks you through adding 20 more test products to your database for c
 
 ### Step 1: Clean Slate (Optional)
 
+
 If you've already run tests, reset everything:
 
 ```powershell
 docker compose down -v
 docker image rm sandbox-seed-redis sandbox-batch 2>$null
-docker compose up -d postgres redis
+docker compose up -d redis_notifications redis_processing
 ```
 
-### Step 2: Add Initial 6 Products + 20 Extended Products
 
-The database is automatically seeded with the initial 6 products. Now add the 20 additional products:
+### Step 2: Seed Initial and Extended Redis Data
+
+The Redis caches are automatically seeded with the initial 6 products. Now add the 20 additional products:
 
 ```powershell
-docker exec sentinel2_postgres psql -U sentinel -d sentinel_events < sql/additional_test_data.sql
+docker compose run --rm seed-redis-extended
 ```
+
 
 ### Step 3: Verify the Data
 
-Check all 26 products are in the database:
+Check all 26 products are in the Redis notifications cache:
 
 ```powershell
-docker exec sentinel2_postgres psql -U sentinel -d sentinel_events -c "SELECT COUNT(*) as total_products FROM events.modified_notifications;"
+docker compose exec redis_notifications redis-cli -n 0 DBSIZE
 ```
 
 Should show: `26`
@@ -104,13 +107,15 @@ docker compose run --rm batch
 - **Sent to queue:** 5 (5 eligible from extended category)
 - **Not queried:** 10 (5 already processed + 5 too recent)
 
-### Step 7: Verify Results in PostgreSQL
+
+### Step 7: Verify Results in Redis
 
 ```powershell
-docker exec sentinel2_postgres psql -U sentinel -d sentinel_events -c "SELECT COUNT(*) as processed_true FROM events.modified_notifications WHERE processed = TRUE;"
+docker compose exec redis_notifications redis-cli -n 0 DBSIZE
+docker compose exec redis_processing redis-cli -n 0 DBSIZE
 ```
 
-Should show more than the initial 1 (the 5 eligible will be marked as processed).
+The notifications cache should have fewer entries (processed ones removed), and the processing cache should reflect current processing status.
 
 ### Step 8: Run Idempotency Check
 
@@ -124,7 +129,7 @@ Second run should find no eligible products (all new ones are either processed, 
 
 | File | Purpose |
 |---|---|
-| `sql/additional_test_data.sql` | 20 new products for extended testing |
+| `seed_redis_extended.py` | Seeds 20 new products for extended testing |
 | `seed_redis_extended.py` | Seeds 5 products as "processing" in Redis |
 | `EXTENDED_TESTING.md` | This file |
 

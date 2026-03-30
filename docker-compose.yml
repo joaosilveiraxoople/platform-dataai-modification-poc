@@ -1,9 +1,20 @@
 services:
-  redis:
+  redis_notifications:
     image: redis:7
-    container_name: sentinel2_redis
+    container_name: sentinel2_redis_notifications
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis_processing:
+    image: redis:7
+    container_name: sentinel2_redis_processing
+    ports:
+      - "6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -15,16 +26,22 @@ services:
     container_name: sentinel2_seed_redis
     command: python seed_redis.py
     environment:
-      REDIS_HOST: redis
+      REDIS_NOTIFICATIONS_HOST: redis_notifications
+      REDIS_PROCESSING_HOST: redis_processing
     depends_on:
-      redis:
+      redis_notifications:
+        condition: service_healthy
+      redis_processing:
         condition: service_healthy
 
   batch:
     build: .
     container_name: sentinel2_batch
     environment:
-      REDIS_HOST: redis
+      REDIS_NOTIFICATIONS_HOST: redis_notifications
+      REDIS_PROCESSING_HOST: redis_processing
     depends_on:
-      redis:
+      redis_notifications:
+        condition: service_healthy
+      redis_processing:
         condition: service_healthy

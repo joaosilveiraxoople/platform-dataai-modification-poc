@@ -18,21 +18,23 @@ import redis
 # ---------------------------------------------------------------------------
 # Configuration (reads from environment variables, with localhost defaults)
 # ---------------------------------------------------------------------------
-REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
+REDIS_NOTIFICATIONS_HOST = os.environ.get("REDIS_NOTIFICATIONS_HOST", "localhost")
+REDIS_NOTIFICATIONS_PORT = int(os.environ.get("REDIS_NOTIFICATIONS_PORT", 6379))
+REDIS_PROCESSING_HOST = os.environ.get("REDIS_PROCESSING_HOST", "localhost")
+REDIS_PROCESSING_PORT = int(os.environ.get("REDIS_PROCESSING_PORT", 6379))
 
-# db 0 = modified notifications cache
+# Redis notifications cache (db 0)
 REDIS_NOTIFICATIONS_CONFIG = {
-    "host": REDIS_HOST,
-    "port": REDIS_PORT,
+    "host": REDIS_NOTIFICATIONS_HOST,
+    "port": REDIS_NOTIFICATIONS_PORT,
     "db": 0,
 }
 
-# db 1 = processing status cache
+# Redis processing status cache (db 0)
 REDIS_PROCESSING_CONFIG = {
-    "host": REDIS_HOST,
-    "port": REDIS_PORT,
-    "db": 1,
+    "host": REDIS_PROCESSING_HOST,
+    "port": REDIS_PROCESSING_PORT,
+    "db": 0,
 }
 
 DELAY_MINUTES = 10

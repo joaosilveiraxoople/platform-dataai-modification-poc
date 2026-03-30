@@ -14,27 +14,30 @@ The simulation uses the following Docker containers:
 
 | Container | Image | Description | Port |
 |---|---|---|---|
-| `sentinel2_redis` | Redis 7 | Notifications cache (db 0) + Processing status cache (db 1) | 6379 |
+| `sentinel2_redis_notifications` | Redis 7 | Notifications cache (db 0) | 6379 |
+| `sentinel2_redis_processing` | Redis 7 | Processing status cache (db 0) | 6380 |
 | `sentinel2_seed_redis` | Python 3.11 | Seeds both Redis databases with test data (runs once) | — |
 | `sentinel2_batch` | Python 3.11 | Batch processing application | — |
 
+
 ### Redis Database Layout
 
-A single Redis instance is used with two logical databases:
+Two Redis instances are used:
 
-| Database | Purpose | Key | Value |
-|---|---|---|---|
-| `db 0` | Notifications cache | `{product_id}` | JSON: `inserted_at` + notification payload |
-| `db 1` | Processing status cache | `{product_id}` | Status string (e.g. `"processing"`) with TTL |
+| Instance | Database | Purpose | Key | Value |
+|---|---|---|---|---|
+| redis_notifications | db 0 | Notifications cache | `{product_id}` | JSON: `inserted_at` + notification payload |
+| redis_processing | db 0 | Processing status cache | `{product_id}` | Status string (e.g. `"processing"`) with TTL |
 
 ---
 
 ## Step 1: Start Redis
 
-From the project root directory, start the Redis container:
+
+From the project root directory, start the Redis containers:
 
 ```powershell
-docker compose up -d redis
+docker compose up -d redis_notifications redis_processing
 ```
 
 Wait for the container to be healthy:
@@ -49,7 +52,8 @@ You should see `sentinel2_redis` with a status of `healthy`.
 
 ## Step 2: Seed Redis with Test Data
 
-Run the seed container to populate both Redis databases:
+
+Run the seed container to populate both Redis caches:
 
 ```powershell
 docker compose run --rm seed-redis
@@ -67,54 +71,61 @@ Before running the batch, verify the data was seeded correctly.
 
 ### Check db 0 (Notifications Cache)
 
-Count all keys in db 0:
+
+Count all keys in db 0 of redis_notifications:
 
 ```powershell
-docker exec sentinel2_redis redis-cli -n 0 DBSIZE
+docker compose exec redis_notifications redis-cli -n 0 DBSIZE
 ```
 
 Expected: `(integer) 5`
 
+
 List all notification keys:
 
 ```powershell
-docker exec sentinel2_redis redis-cli -n 0 KEYS "*"
+docker compose exec redis_notifications redis-cli -n 0 KEYS "*"
 ```
+
 
 Inspect a specific notification entry:
 
 ```powershell
-docker exec sentinel2_redis redis-cli -n 0 GET "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+docker compose exec redis_notifications redis-cli -n 0 GET "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
 ```
 
 ### Check db 1 (Processing Status Cache)
 
-Count all keys in db 1:
+
+Count all keys in db 0 of redis_processing:
 
 ```powershell
-docker exec sentinel2_redis redis-cli -n 1 DBSIZE
+docker compose exec redis_processing redis-cli -n 0 DBSIZE
 ```
 
 Expected: `(integer) 1`
 
+
 List all processing status keys:
 
 ```powershell
-docker exec sentinel2_redis redis-cli -n 1 KEYS "*"
+docker compose exec redis_processing redis-cli -n 0 KEYS "*"
 ```
+
 
 Check if a specific product is being processed:
 
 ```powershell
-docker exec sentinel2_redis redis-cli -n 1 GET "b7c3d4e5-6f89-4a2b-c1d3-e5f6a7b8c9d0"
+docker compose exec redis_processing redis-cli -n 0 GET "b7c3d4e5-6f89-4a2b-c1d3-e5f6a7b8c9d0"
 ```
 
 Expected: `"processing"`
 
+
 Check remaining TTL on a processing key:
 
 ```powershell
-docker exec sentinel2_redis redis-cli -n 1 TTL "b7c3d4e5-6f89-4a2b-c1d3-e5f6a7b8c9d0"
+docker compose exec redis_processing redis-cli -n 0 TTL "b7c3d4e5-6f89-4a2b-c1d3-e5f6a7b8c9d0"
 ```
 
 ---

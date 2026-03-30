@@ -18,18 +18,18 @@ This system handles the workflow for reprocessing Sentinel-2 products when "modi
 
 The modified notifications reprocessing system consists of three main components:
 
-1. **Redis Notifications Cache** - Stores notifications awaiting reprocessing
-2. **Redis Processing Status Cache** - Tracks the processing status of each product to prevent conflicts
+1. **Redis Notifications Cache** (separate Redis instance) - Stores notifications awaiting reprocessing
+2. **Redis Processing Status Cache** (separate Redis instance) - Tracks the processing status of each product to prevent conflicts
 3. **Batch Application** - Sends the modified events to the queue for processing
 
-Redis cache can be the same and the new modifications and status of each product processing can be isolated at redis database level.
+Each cache is a separate Redis instance for isolation and scalability.
 
 ### System Workflow
 
 ```
 1. Notification Received
    ↓
-2. Stored in Redis Notifications Cache (db 0)
+2. Stored in Redis Notifications Cache (db 0 of redis_notifications)
    Key = product_id, Value = JSON {inserted_at, notification}
    ↓
 3. Batch Job Runs Every 10 Minutes
@@ -47,7 +47,7 @@ Redis cache can be the same and the new modifications and status of each product
 
 ---
 
-## Redis Notifications Cache (db 0)
+## Redis Notifications Cache (db 0 of redis_notifications)
 
 The notifications cache stores modified notifications awaiting reprocessing:
 - When a "modified" notification is received, it is written to Redis db 0
@@ -78,7 +78,7 @@ Example value:
 
 ---
 
-## Redis Processing Status Cache (db 1)
+## Redis Processing Status Cache (db 0 of redis_processing)
 
 The processing status cache maintains a record of products currently being processed:
 - When processing of a product begins, an entry is written to Redis db 1 with the **Product ID as the key** and **"processing" as the value**
@@ -109,7 +109,7 @@ Only notifications with an `inserted_at` timestamp older than 10 minutes are con
 ### Step 3: Check Redis Processing Status Cache (db 1)
 
 For each eligible notification, check if the product is already being processed:
-- Query Redis db 1 using the `product_id`
+- Query Redis db 0 of redis_processing using the `product_id`
 - If an entry exists, the product is currently being processed → skip this notification
 - If no entry exists, the product is not being processed → proceed to Step 4
 
@@ -185,14 +185,14 @@ docker compose run --rm batch
 ### 4. Verify Results
 
 ```powershell
-# Check notifications cache (db 0) — processed entries should be removed
-docker compose exec redis redis-cli -n 0 KEYS '*'
+# Check notifications cache (db 0 of redis_notifications) — processed entries should be removed
+docker compose exec redis_notifications redis-cli -n 0 KEYS '*'
 
-# Check processing status cache (db 1)
-docker compose exec redis redis-cli -n 1 KEYS '*'
+# Check processing status cache (db 0 of redis_processing)
+docker compose exec redis_processing redis-cli -n 0 KEYS '*'
 
 # Inspect a specific notification entry
-docker compose exec redis redis-cli -n 0 GET "<product_id>"
+docker compose exec redis_notifications redis-cli -n 0 GET "<product_id>"
 ```
 
 ---

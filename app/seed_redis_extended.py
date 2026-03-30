@@ -12,16 +12,19 @@ from datetime import datetime, timezone, timedelta
 import redis
 
 
+
 def seed_additional_redis():
-    redis_host = os.environ.get("REDIS_HOST", "localhost")
-    redis_port = int(os.environ.get("REDIS_PORT", 6379))
+    notifications_host = os.environ.get("REDIS_NOTIFICATIONS_HOST", "localhost")
+    notifications_port = int(os.environ.get("REDIS_NOTIFICATIONS_PORT", 6379))
+    processing_host = os.environ.get("REDIS_PROCESSING_HOST", "localhost")
+    processing_port = int(os.environ.get("REDIS_PROCESSING_PORT", 6379))
 
     # Connect to notifications cache (db 0)
-    notifications_client = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=True)
+    notifications_client = redis.Redis(host=notifications_host, port=notifications_port, db=0, decode_responses=True)
     notifications_client.ping()
 
-    # Connect to processing status cache (db 1)
-    processing_client = redis.Redis(host=redis_host, port=redis_port, db=1, decode_responses=True)
+    # Connect to processing status cache (db 0)
+    processing_client = redis.Redis(host=processing_host, port=processing_port, db=0, decode_responses=True)
     processing_client.ping()
 
     print("[Redis] Connected to both caches.\n")

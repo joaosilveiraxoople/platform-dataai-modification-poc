@@ -20,8 +20,8 @@ import redis
 # Configuration
 # ---------------------------------------------------------------------------
 REDIS_CONFIG = {
-    "host": os.environ.get("REDIS_HOST", "localhost"),
-    "port": int(os.environ.get("REDIS_PORT", 6379)),
+    "host": os.environ.get("REDIS_NOTIFICATIONS_HOST", "localhost"),
+    "port": int(os.environ.get("REDIS_NOTIFICATIONS_PORT", 6379)),
     "db": 0,  # db 0 = modified notifications cache
 }
 
